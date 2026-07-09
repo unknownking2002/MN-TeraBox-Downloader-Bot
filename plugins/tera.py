@@ -5,16 +5,17 @@ import re
 import tempfile
 import requests
 import asyncio
+from uuid import uuid4
 from datetime import datetime, timedelta
-from urllib.parse import urlencode, urlparse, parse_qs
+from urllib.parse import urlencode, urlparse, parse_qs, quote_plus, unquote
 from pyrogram import Client 
 from pyrogram import filters
-from pyrogram.types import Message
+from pyrogram.types import Message, CallbackQuery
 from verify_patch import IS_VERIFY, is_verified, build_verification_link, HOW_TO_VERIFY
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pymongo import MongoClient
 import shutil
-from config import CHANNEL, DATABASE
+from config import CHANNEL, DATABASE, TERABOX
 #please give credits https://github.com/MN-BOTS
 #  @MrMNTG @MusammilN
 
@@ -25,7 +26,11 @@ settings_col = db["terabox_settings"]
 queue_col = db["terabox_queue"]
 last_upload_col = db["terabox_lastupload"]
 
-TERABOX_REGEX = r'https?://(?:www\.)?[^/\s]*tera[^/\s]*\.[a-z]+/s/[^\s]+'
+TERABOX_REGEX = r'https?://(?:www\.)?[^/\s]*tera[^/\s]*\.[a-z]+/(?:s|dl)/[^\s]+'
+API_DOWNLOAD_REGEX = r'https?://terabox-api\.mn-bots\.workers\.dev/dl/[^\s]+'
+REQUEST_TIMEOUT = 30
+QUALITY_SELECTIONS = {}
+QUALITY_SELECTION_TTL = 900
 
 COOKIE = "ndus=YzrYlCHteHuixx7IN5r0fc3sajSOYAHfqDoPM0dP" # add your own cookies like ndus=YzrYlCHteHuixx7IN5r0ABCDFXDGSTGBDJKLBKMKH
 
@@ -73,6 +78,85 @@ def get_size(bytes_len: int) -> str:
         return f"{bytes_len / 1024:.2f} KB"
     return f"{bytes_len} bytes"
 
+
+def clean_filename(filename: str) -> str:
+    filename = os.path.basename(filename or "download")
+    return re.sub(r'[\\/:*?"<>|]+', "_", filename).strip() or "download"
+
+
+def filename_from_response(response, fallback: str) -> str:
+    content_disposition = response.headers.get("content-disposition", "")
+    filename_match = re.search(r'filename\*?=(?:UTF-8\'\')?["\']?([^"\';]+)', content_disposition, re.IGNORECASE)
+    if filename_match:
+        return clean_filename(unquote(filename_match.group(1)))
+    return clean_filename(fallback)
+
+def get_api_download_url(api_data: dict) -> str:
+    qualities = api_data.get("qualities") or {}
+    best_quality = api_data.get("best_quality")
+    if best_quality and qualities.get(best_quality):
+        return qualities[best_quality]
+    if qualities:
+        return next(iter(qualities.values()))
+    return api_data.get("media_url") or api_data.get("direct_download_url", "")
+
+
+def get_api_download_options(api_data: dict) -> dict:
+    options = {}
+    qualities = api_data.get("qualities") or {}
+    for quality, download_url in qualities.items():
+        if download_url:
+            options[str(quality)] = download_url
+
+    if options:
+        return options
+
+    if api_data.get("media_url"):
+        options["Stream"] = api_data["media_url"]
+    elif api_data.get("direct_download_url"):
+        options["Direct"] = api_data["direct_download_url"]
+
+    return options
+
+
+def get_api_file_info(share_url: str) -> dict:
+    api_url = f"{TERABOX.API_DOWNLOAD_ENDPOINT}?url={quote_plus(share_url)}"
+    resp = requests.get(api_url, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("success"):
+        raise ValueError(data.get("message") or data.get("error") or "API download failed")
+
+    download_options = get_api_download_options(data)
+    download_link = get_api_download_url(data)
+    if not download_options and not download_link:
+        raise ValueError("API response did not include a downloadable link")
+
+    size_bytes = int(data.get("size") or 0)
+    return {
+        "name": clean_filename(data.get("filename") or "download"),
+        "download_link": download_link,
+        "download_options": download_options,
+        "best_quality": data.get("best_quality"),
+        "size_bytes": size_bytes,
+        "size_str": get_size(size_bytes),
+        "resolved_url": data.get("resolved_url") or share_url,
+        "original_url": share_url,
+        "source": "api",
+    }
+
+def get_stream_link_info(stream_url: str) -> dict:
+    filename = clean_filename(urlparse(stream_url).path.rsplit("/", 1)[-1] or "download")
+    return {
+        "name": filename,
+        "download_link": stream_url,
+        "size_bytes": 0,
+        "size_str": get_size(0),
+        "resolved_url": stream_url,
+        "original_url": stream_url,
+        "source": "stream",
+    }
+
 def find_between(text: str, start: str, end: str) -> str:
     try:
         return text.split(start, 1)[1].split(end, 1)[0]
@@ -80,7 +164,7 @@ def find_between(text: str, start: str, end: str) -> str:
         return ""
 
 def get_file_info(share_url: str) -> dict:
-    resp = requests.get(share_url, headers=HEADERS, allow_redirects=True)
+    resp = requests.get(share_url, headers=HEADERS, allow_redirects=True, timeout=REQUEST_TIMEOUT)
     if resp.status_code != 200:
         raise ValueError(f"Failed to fetch share page ({resp.status_code})")
     final_url = resp.url
@@ -90,7 +174,7 @@ def get_file_info(share_url: str) -> dict:
     if not surl:
         raise ValueError("Invalid share URL (missing surl)")
 
-    page = requests.get(final_url, headers=HEADERS)
+    page = requests.get(final_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
     html = page.text
 
     js_token = find_between(html, 'fn%28%22', '%22%29')
@@ -107,7 +191,8 @@ def get_file_info(share_url: str) -> dict:
     }
     info = requests.get(
         "https://www.terabox.app/share/list?" + urlencode(params),
-        headers=HEADERS
+        headers=HEADERS,
+        timeout=REQUEST_TIMEOUT
     ).json()
 
     if info.get("errno") or not info.get("list"):
@@ -120,8 +205,197 @@ def get_file_info(share_url: str) -> dict:
         "name": file.get("server_filename", "download"),
         "download_link": file.get("dlink", ""),
         "size_bytes": size_bytes,
-        "size_str": get_size(size_bytes)
+        "size_str": get_size(size_bytes),
+        "resolved_url": share_url,
+        "original_url": share_url,
+        "source": "scraper",
     }
+
+
+def get_download_info(url: str) -> dict:
+    if re.match(API_DOWNLOAD_REGEX, url):
+        return get_stream_link_info(url)
+
+    if TERABOX.USE_API_DOWNLOAD:
+        try:
+            return get_api_file_info(url)
+        except Exception:
+            if not TERABOX.API_FALLBACK_TO_SCRAPER:
+                raise
+
+    return get_file_info(url)
+
+
+def get_cache_keys(info: dict) -> list:
+    keys = [
+        info.get("original_url"),
+        info.get("resolved_url"),
+        info.get("download_link"),
+    ]
+    return list(dict.fromkeys(key for key in keys if key))
+
+
+def get_cached_upload(info: dict):
+    keys = get_cache_keys(info)
+    if not keys:
+        return None
+    return last_upload_col.find_one({"keys": {"$in": keys}, "file_id": {"$exists": True}})
+
+
+def save_cached_upload(info: dict, file_id: str):
+    if not file_id:
+        return
+
+    keys = get_cache_keys(info)
+    if not keys:
+        return
+
+    now = datetime.utcnow()
+    cached = last_upload_col.find_one({"keys": {"$in": keys}})
+    cache_data = {
+        "file_id": file_id,
+        "file_name": info.get("name", "download"),
+        "size_str": info.get("size_str", get_size(0)),
+        "resolved_url": info.get("resolved_url"),
+        "updated_at": now,
+    }
+
+    if cached:
+        last_upload_col.update_one(
+            {"_id": cached["_id"]},
+            {"$set": cache_data, "$addToSet": {"keys": {"$each": keys}}}
+        )
+        return
+
+    cache_data["keys"] = keys
+    cache_data["created_at"] = now
+    last_upload_col.insert_one(cache_data)
+
+
+def build_caption(info: dict, fallback_url: str) -> str:
+    return (
+        f"File Name: {info['name']}\n"
+        f"File Size: {info['size_str']}\n"
+        f"Link: {info.get('resolved_url', fallback_url)}"
+    )
+
+
+async def send_cached_upload(client, message: Message, cached: dict, info: dict) -> bool:
+    file_id = cached.get("file_id")
+    if not file_id:
+        return False
+
+    info = info.copy()
+    info["name"] = cached.get("file_name") or info.get("name", "download")
+    info["size_str"] = cached.get("size_str") or info.get("size_str", get_size(0))
+    caption = build_caption(info, message.text.strip())
+
+    await message.reply("♻️ File found in cache. Sending without downloading again...")
+
+    try:
+        if CHANNEL.ID:
+            await client.send_document(
+                chat_id=CHANNEL.ID,
+                document=file_id,
+                caption=caption,
+                file_name=info["name"]
+            )
+
+        sent_msg = await client.send_document(
+            chat_id=message.chat.id,
+            document=file_id,
+            caption=caption,
+            file_name=info["name"],
+            protect_content=True
+        )
+    except Exception:
+        return False
+
+    await message.reply("✅ Cached file will be deleted from your chat after 12 hours.")
+    await asyncio.sleep(43200)
+    try:
+        await sent_msg.delete()
+    except Exception:
+        pass
+    return True
+
+
+def build_quality_buttons(selection_id: str, info: dict) -> InlineKeyboardMarkup:
+    buttons = []
+    best_quality = info.get("best_quality")
+    for quality in info.get("download_options", {}):
+        label = f"{quality} ⭐" if quality == best_quality else quality
+        buttons.append([InlineKeyboardButton(label, callback_data=f"tera_dl:{selection_id}:{quality}")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def cache_quality_selection(user_id: int, info: dict) -> str:
+    selection_id = uuid4().hex[:12]
+    QUALITY_SELECTIONS[selection_id] = {
+        "user_id": user_id,
+        "info": info,
+        "expires_at": asyncio.get_event_loop().time() + QUALITY_SELECTION_TTL,
+    }
+    return selection_id
+
+
+def get_cached_quality_selection(selection_id: str, user_id: int):
+    selection = QUALITY_SELECTIONS.get(selection_id)
+    now = asyncio.get_event_loop().time()
+    if not selection or selection["expires_at"] < now:
+        QUALITY_SELECTIONS.pop(selection_id, None)
+        return None
+    if selection["user_id"] != user_id:
+        return None
+    return selection
+
+
+async def download_and_upload(client, message: Message, info: dict):
+    temp_path = None
+
+    await message.reply("📥 Downloading...")
+
+    try:
+        with requests.get(info["download_link"], headers=DL_HEADERS, stream=True, timeout=REQUEST_TIMEOUT) as r:
+            r.raise_for_status()
+            info["name"] = filename_from_response(r, info["name"])
+            temp_path = os.path.join(tempfile.gettempdir(), info["name"])
+            with open(temp_path, "wb") as f:
+                shutil.copyfileobj(r.raw, f)
+
+        caption = build_caption(info, message.text.strip())
+
+        if CHANNEL.ID:
+            await client.send_document(
+                chat_id=CHANNEL.ID,
+                document=temp_path,
+                caption=caption,
+                file_name=info["name"]
+            )
+
+        sent_msg = await client.send_document(
+            chat_id=message.chat.id,
+            document=temp_path,
+            caption=caption,
+            file_name=info["name"],
+            protect_content=True
+        )
+
+        if sent_msg.document:
+            save_cached_upload(info, sent_msg.document.file_id)
+
+        await message.reply("✅ File will be deleted from your chat after 12 hours.")
+        await asyncio.sleep(43200)
+        try:
+            await sent_msg.delete()
+        except Exception:
+            pass
+
+    except Exception as e:
+        await message.reply(f"❌ Upload failed:\n`{e}`")
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
 @Client.on_message(filters.private & filters.regex(TERABOX_REGEX))
@@ -143,52 +417,63 @@ async def handle_terabox(client, message: Message):
         return
 
     url = message.text.strip()
+    cached = get_cached_upload({"original_url": url, "resolved_url": url, "download_link": url})
+    cached_info = {
+        "name": cached.get("file_name", "download") if cached else "download",
+        "size_str": cached.get("size_str", get_size(0)) if cached else get_size(0),
+        "resolved_url": cached.get("resolved_url") or url if cached else url,
+    }
+    if cached and await send_cached_upload(client, message, cached, cached_info):
+        return
+
     try:
-        info = get_file_info(url)
+        info = get_download_info(url)
     except Exception as e:
         return await message.reply(f"❌ Failed to get file info:\n{e}")
 
-    temp_path = os.path.join(tempfile.gettempdir(), info["name"])
+    cached = get_cached_upload(info)
+    if cached and await send_cached_upload(client, message, cached, info):
+        return
 
-    await message.reply("📥 Downloading...")
+    download_options = info.get("download_options") or {}
+    if len(download_options) > 1:
+        selection_id = cache_quality_selection(user_id, info)
+        await message.reply(
+            f"🎞 Select download quality for `{info['name']}`:",
+            reply_markup=build_quality_buttons(selection_id, info)
+        )
+        return
 
+    if download_options:
+        info["download_link"] = next(iter(download_options.values()))
+
+    await download_and_upload(client, message, info)
+
+
+@Client.on_callback_query(filters.regex(r"^tera_dl:"))
+async def handle_quality_selection(client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
     try:
-        with requests.get(info["download_link"], headers=DL_HEADERS, stream=True) as r:
-            r.raise_for_status()
-            with open(temp_path, "wb") as f:
-                shutil.copyfileobj(r.raw, f)
+        _, selection_id, quality = callback_query.data.split(":", 2)
+    except ValueError:
+        return await callback_query.answer("Invalid selection.", show_alert=True)
 
-        caption = (
-            f"File Name: {info['name']}\n"
-            f"File Size: {info['size_str']}\n"
-            f"Link: {url}"
-        )
+    selection = get_cached_quality_selection(selection_id, user_id)
+    if not selection:
+        return await callback_query.answer("This quality selection expired. Send the link again.", show_alert=True)
 
-        if CHANNEL.ID:
-            await client.send_document(
-                chat_id=CHANNEL.ID,
-                document=temp_path,
-                caption=caption,
-                file_name=info["name"]
-            )
+    info = selection["info"].copy()
+    download_url = info.get("download_options", {}).get(quality)
+    if not download_url:
+        return await callback_query.answer("Selected quality is unavailable.", show_alert=True)
 
-        sent_msg = await client.send_document(
-            chat_id=message.chat.id,
-            document=temp_path,
-            caption=caption,
-            file_name=info["name"],
-            protect_content=True
-        )
+    QUALITY_SELECTIONS.pop(selection_id, None)
+    info["download_link"] = download_url
+    await callback_query.answer(f"Selected {quality}")
+    await callback_query.message.edit_reply_markup(reply_markup=None)
 
-        await message.reply("✅ File will be deleted from your chat after 12 hours.")
-        await asyncio.sleep(43200)
-        try:
-            await sent_msg.delete()
-        except Exception:
-            pass
+    cached = get_cached_upload(info)
+    if cached and await send_cached_upload(client, callback_query.message, cached, info):
+        return
 
-    except Exception as e:
-        await message.reply(f"❌ Upload failed:\n`{e}`")
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+    await download_and_upload(client, callback_query.message, info)
