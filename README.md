@@ -13,8 +13,10 @@ This bot allows users to paste a TeraBox file link and get the file uploaded dir
 
 * 🔗 Accepts public TeraBox share links
 * 🧠 Automatically extracts file info (name, size, direct link)
+* 🌐 Supports API-based resolving through the MN Bots TeraBox API
+* 🎬 Accepts API `/dl/` stream links and downloads them directly
 * ⚙️ Verifies user before allowing downloads (optional, with tutorial)
-* ⬇️ Downloads the file using a direct TeraBox download link
+* ⬇️ Downloads the file using an API stream link or direct TeraBox download link
 * 📤 Uploads the file back to Telegram (both to user PM & fixed channel)
 * 🔐 User uploads use **restricted forwarding** for protection
 * ⏲️ Automatically deletes the user file after 12 hours to save space
@@ -24,7 +26,7 @@ This bot allows users to paste a TeraBox file link and get the file uploaded dir
 ## 📥 How To Use
 
 1. Start the bot.
-2. Send a valid TeraBox public share link 
+2. Send a valid TeraBox public share link or a supported API `/dl/` stream link
 3. The bot will:
 
    * (If enabled) Ask for verification
@@ -61,6 +63,9 @@ Set the following environment variables in your deployment dashboard:
 | `OWNER`         | User ID of the bot owner for admin privileges                              |
 | `PORT`          | Port number for web-related features (e.g., 8000)                          |
 | `DB_URI`        | MongoDB connection URI for database access                                |
+| `TERABOX_API_DOWNLOAD_ENDPOINT` | API endpoint used to resolve TeraBox share links (default: `https://terabox-api.mn-bots.workers.dev/download`) |
+| `TERABOX_USE_API_DOWNLOAD` | Set to `false` to disable API-based resolving and use only the scraper |
+| `TERABOX_API_FALLBACK` | Set to `false` to stop falling back to the scraper when API resolving fails |
 
 ---
 ## Important
@@ -97,7 +102,7 @@ A: You can disable it by setting `IS_VERIFY=false` in your config.
 ## 🤝 Credits
 
 * Maintained by: **@mnbots**
-* No external APIs used — pure Pyrogram, MongoDB, and Python
+* Uses Pyrogram, MongoDB, Python, and optional MN Bots API-based TeraBox resolving
 
 ---
 
