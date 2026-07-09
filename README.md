@@ -16,6 +16,7 @@ This bot allows users to paste a TeraBox file link and get the file uploaded dir
 * 🌐 Supports API-based resolving through the MN Bots TeraBox API
 * 🎬 Accepts API `/dl/` stream links and downloads them directly
 * 🎞 Shows quality buttons when the API returns multiple download URLs
+* ♻️ Reuses cached Telegram file IDs, so previously downloaded files are sent again without re-downloading
 * ⚙️ Verifies user before allowing downloads (optional, with tutorial)
 * ⬇️ Downloads the file using an API stream link or direct TeraBox download link
 * 📤 Uploads the file back to Telegram (both to user PM & fixed channel)
@@ -33,7 +34,8 @@ This bot allows users to paste a TeraBox file link and get the file uploaded dir
    * (If enabled) Ask for verification
    * Fetch file info
    * Ask you to select a quality when multiple API URLs are available
-   * Download and upload to Telegram
+   * Re-send a cached Telegram file if it was downloaded before
+   * Download and upload to Telegram only when no cache exists
    * Notify that file will be deleted in 12 hours
 
 ---

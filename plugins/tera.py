@@ -141,6 +141,7 @@ def get_api_file_info(share_url: str) -> dict:
         "size_bytes": size_bytes,
         "size_str": get_size(size_bytes),
         "resolved_url": data.get("resolved_url") or share_url,
+        "original_url": share_url,
         "source": "api",
     }
 
@@ -152,6 +153,7 @@ def get_stream_link_info(stream_url: str) -> dict:
         "size_bytes": 0,
         "size_str": get_size(0),
         "resolved_url": stream_url,
+        "original_url": stream_url,
         "source": "stream",
     }
 
@@ -205,6 +207,7 @@ def get_file_info(share_url: str) -> dict:
         "size_bytes": size_bytes,
         "size_str": get_size(size_bytes),
         "resolved_url": share_url,
+        "original_url": share_url,
         "source": "scraper",
     }
 
@@ -221,6 +224,100 @@ def get_download_info(url: str) -> dict:
                 raise
 
     return get_file_info(url)
+
+
+def get_cache_keys(info: dict) -> list:
+    keys = [
+        info.get("original_url"),
+        info.get("resolved_url"),
+        info.get("download_link"),
+    ]
+    return list(dict.fromkeys(key for key in keys if key))
+
+
+def get_cached_upload(info: dict):
+    keys = get_cache_keys(info)
+    if not keys:
+        return None
+    return last_upload_col.find_one({"keys": {"$in": keys}, "file_id": {"$exists": True}})
+
+
+def save_cached_upload(info: dict, file_id: str):
+    if not file_id:
+        return
+
+    keys = get_cache_keys(info)
+    if not keys:
+        return
+
+    now = datetime.utcnow()
+    cached = last_upload_col.find_one({"keys": {"$in": keys}})
+    cache_data = {
+        "file_id": file_id,
+        "file_name": info.get("name", "download"),
+        "size_str": info.get("size_str", get_size(0)),
+        "resolved_url": info.get("resolved_url"),
+        "updated_at": now,
+    }
+
+    if cached:
+        last_upload_col.update_one(
+            {"_id": cached["_id"]},
+            {"$set": cache_data, "$addToSet": {"keys": {"$each": keys}}}
+        )
+        return
+
+    cache_data["keys"] = keys
+    cache_data["created_at"] = now
+    last_upload_col.insert_one(cache_data)
+
+
+def build_caption(info: dict, fallback_url: str) -> str:
+    return (
+        f"File Name: {info['name']}\n"
+        f"File Size: {info['size_str']}\n"
+        f"Link: {info.get('resolved_url', fallback_url)}"
+    )
+
+
+async def send_cached_upload(client, message: Message, cached: dict, info: dict) -> bool:
+    file_id = cached.get("file_id")
+    if not file_id:
+        return False
+
+    info = info.copy()
+    info["name"] = cached.get("file_name") or info.get("name", "download")
+    info["size_str"] = cached.get("size_str") or info.get("size_str", get_size(0))
+    caption = build_caption(info, message.text.strip())
+
+    await message.reply("♻️ File found in cache. Sending without downloading again...")
+
+    try:
+        if CHANNEL.ID:
+            await client.send_document(
+                chat_id=CHANNEL.ID,
+                document=file_id,
+                caption=caption,
+                file_name=info["name"]
+            )
+
+        sent_msg = await client.send_document(
+            chat_id=message.chat.id,
+            document=file_id,
+            caption=caption,
+            file_name=info["name"],
+            protect_content=True
+        )
+    except Exception:
+        return False
+
+    await message.reply("✅ Cached file will be deleted from your chat after 12 hours.")
+    await asyncio.sleep(43200)
+    try:
+        await sent_msg.delete()
+    except Exception:
+        pass
+    return True
 
 
 def build_quality_buttons(selection_id: str, info: dict) -> InlineKeyboardMarkup:
@@ -266,11 +363,7 @@ async def download_and_upload(client, message: Message, info: dict):
             with open(temp_path, "wb") as f:
                 shutil.copyfileobj(r.raw, f)
 
-        caption = (
-            f"File Name: {info['name']}\n"
-            f"File Size: {info['size_str']}\n"
-            f"Link: {info.get('resolved_url', message.text.strip())}"
-        )
+        caption = build_caption(info, message.text.strip())
 
         if CHANNEL.ID:
             await client.send_document(
@@ -287,6 +380,9 @@ async def download_and_upload(client, message: Message, info: dict):
             file_name=info["name"],
             protect_content=True
         )
+
+        if sent_msg.document:
+            save_cached_upload(info, sent_msg.document.file_id)
 
         await message.reply("✅ File will be deleted from your chat after 12 hours.")
         await asyncio.sleep(43200)
@@ -321,10 +417,23 @@ async def handle_terabox(client, message: Message):
         return
 
     url = message.text.strip()
+    cached = get_cached_upload({"original_url": url, "resolved_url": url, "download_link": url})
+    cached_info = {
+        "name": cached.get("file_name", "download") if cached else "download",
+        "size_str": cached.get("size_str", get_size(0)) if cached else get_size(0),
+        "resolved_url": cached.get("resolved_url") or url if cached else url,
+    }
+    if cached and await send_cached_upload(client, message, cached, cached_info):
+        return
+
     try:
         info = get_download_info(url)
     except Exception as e:
         return await message.reply(f"❌ Failed to get file info:\n{e}")
+
+    cached = get_cached_upload(info)
+    if cached and await send_cached_upload(client, message, cached, info):
+        return
 
     download_options = info.get("download_options") or {}
     if len(download_options) > 1:
@@ -362,4 +471,9 @@ async def handle_quality_selection(client, callback_query: CallbackQuery):
     info["download_link"] = download_url
     await callback_query.answer(f"Selected {quality}")
     await callback_query.message.edit_reply_markup(reply_markup=None)
+
+    cached = get_cached_upload(info)
+    if cached and await send_cached_upload(client, callback_query.message, cached, info):
+        return
+
     await download_and_upload(client, callback_query.message, info)
