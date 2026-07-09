@@ -15,6 +15,7 @@ This bot allows users to paste a TeraBox file link and get the file uploaded dir
 * 🧠 Automatically extracts file info (name, size, direct link)
 * 🌐 Supports API-based resolving through the MN Bots TeraBox API
 * 🎬 Accepts API `/dl/` stream links and downloads them directly
+* 🎞 Shows quality buttons when the API returns multiple download URLs
 * ⚙️ Verifies user before allowing downloads (optional, with tutorial)
 * ⬇️ Downloads the file using an API stream link or direct TeraBox download link
 * 📤 Uploads the file back to Telegram (both to user PM & fixed channel)
@@ -31,6 +32,7 @@ This bot allows users to paste a TeraBox file link and get the file uploaded dir
 
    * (If enabled) Ask for verification
    * Fetch file info
+   * Ask you to select a quality when multiple API URLs are available
    * Download and upload to Telegram
    * Notify that file will be deleted in 12 hours
 

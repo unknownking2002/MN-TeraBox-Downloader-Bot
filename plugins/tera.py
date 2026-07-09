@@ -5,11 +5,12 @@ import re
 import tempfile
 import requests
 import asyncio
+from uuid import uuid4
 from datetime import datetime, timedelta
 from urllib.parse import urlencode, urlparse, parse_qs, quote_plus, unquote
 from pyrogram import Client 
 from pyrogram import filters
-from pyrogram.types import Message
+from pyrogram.types import Message, CallbackQuery
 from verify_patch import IS_VERIFY, is_verified, build_verification_link, HOW_TO_VERIFY
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pymongo import MongoClient
@@ -28,6 +29,8 @@ last_upload_col = db["terabox_lastupload"]
 TERABOX_REGEX = r'https?://(?:www\.)?[^/\s]*tera[^/\s]*\.[a-z]+/(?:s|dl)/[^\s]+'
 API_DOWNLOAD_REGEX = r'https?://terabox-api\.mn-bots\.workers\.dev/dl/[^\s]+'
 REQUEST_TIMEOUT = 30
+QUALITY_SELECTIONS = {}
+QUALITY_SELECTION_TTL = 900
 
 COOKIE = "ndus=YzrYlCHteHuixx7IN5r0fc3sajSOYAHfqDoPM0dP" # add your own cookies like ndus=YzrYlCHteHuixx7IN5r0ABCDFXDGSTGBDJKLBKMKH
 
@@ -89,15 +92,32 @@ def filename_from_response(response, fallback: str) -> str:
     return clean_filename(fallback)
 
 def get_api_download_url(api_data: dict) -> str:
-    if api_data.get("direct_download_url"):
-        return api_data["direct_download_url"]
     qualities = api_data.get("qualities") or {}
     best_quality = api_data.get("best_quality")
     if best_quality and qualities.get(best_quality):
         return qualities[best_quality]
     if qualities:
         return next(iter(qualities.values()))
-    return api_data.get("media_url", "")
+    return api_data.get("media_url") or api_data.get("direct_download_url", "")
+
+
+def get_api_download_options(api_data: dict) -> dict:
+    options = {}
+    qualities = api_data.get("qualities") or {}
+    for quality, download_url in qualities.items():
+        if download_url:
+            options[str(quality)] = download_url
+
+    if options:
+        return options
+
+    if api_data.get("media_url"):
+        options["Stream"] = api_data["media_url"]
+    elif api_data.get("direct_download_url"):
+        options["Direct"] = api_data["direct_download_url"]
+
+    return options
+
 
 def get_api_file_info(share_url: str) -> dict:
     api_url = f"{TERABOX.API_DOWNLOAD_ENDPOINT}?url={quote_plus(share_url)}"
@@ -107,14 +127,17 @@ def get_api_file_info(share_url: str) -> dict:
     if not data.get("success"):
         raise ValueError(data.get("message") or data.get("error") or "API download failed")
 
+    download_options = get_api_download_options(data)
     download_link = get_api_download_url(data)
-    if not download_link:
+    if not download_options and not download_link:
         raise ValueError("API response did not include a downloadable link")
 
     size_bytes = int(data.get("size") or 0)
     return {
         "name": clean_filename(data.get("filename") or "download"),
         "download_link": download_link,
+        "download_options": download_options,
+        "best_quality": data.get("best_quality"),
         "size_bytes": size_bytes,
         "size_str": get_size(size_bytes),
         "resolved_url": data.get("resolved_url") or share_url,
@@ -200,30 +223,37 @@ def get_download_info(url: str) -> dict:
     return get_file_info(url)
 
 
-@Client.on_message(filters.private & filters.regex(TERABOX_REGEX))
-async def handle_terabox(client, message: Message):
-    user_id = message.from_user.id
+def build_quality_buttons(selection_id: str, info: dict) -> InlineKeyboardMarkup:
+    buttons = []
+    best_quality = info.get("best_quality")
+    for quality in info.get("download_options", {}):
+        label = f"{quality} ⭐" if quality == best_quality else quality
+        buttons.append([InlineKeyboardButton(label, callback_data=f"tera_dl:{selection_id}:{quality}")])
+    return InlineKeyboardMarkup(buttons)
 
-    if IS_VERIFY and not await is_verified(user_id):
-        verify_url = await build_verification_link(client.me.username, user_id)
-        buttons = [
-            [
-                InlineKeyboardButton("✅ Verify Now", url=verify_url),
-                InlineKeyboardButton("📖 Tutorial", url=HOW_TO_VERIFY)
-            ]
-        ]
-        await message.reply_text(
-            "🔐 You must verify before using this command.\n\n⏳ Verification lasts for 12 hours.",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-        return
 
-    url = message.text.strip()
-    try:
-        info = get_download_info(url)
-    except Exception as e:
-        return await message.reply(f"❌ Failed to get file info:\n{e}")
+def cache_quality_selection(user_id: int, info: dict) -> str:
+    selection_id = uuid4().hex[:12]
+    QUALITY_SELECTIONS[selection_id] = {
+        "user_id": user_id,
+        "info": info,
+        "expires_at": asyncio.get_event_loop().time() + QUALITY_SELECTION_TTL,
+    }
+    return selection_id
 
+
+def get_cached_quality_selection(selection_id: str, user_id: int):
+    selection = QUALITY_SELECTIONS.get(selection_id)
+    now = asyncio.get_event_loop().time()
+    if not selection or selection["expires_at"] < now:
+        QUALITY_SELECTIONS.pop(selection_id, None)
+        return None
+    if selection["user_id"] != user_id:
+        return None
+    return selection
+
+
+async def download_and_upload(client, message: Message, info: dict):
     temp_path = None
 
     await message.reply("📥 Downloading...")
@@ -239,7 +269,7 @@ async def handle_terabox(client, message: Message):
         caption = (
             f"File Name: {info['name']}\n"
             f"File Size: {info['size_str']}\n"
-            f"Link: {info.get('resolved_url', url)}"
+            f"Link: {info.get('resolved_url', message.text.strip())}"
         )
 
         if CHANNEL.ID:
@@ -270,3 +300,66 @@ async def handle_terabox(client, message: Message):
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
+
+
+@Client.on_message(filters.private & filters.regex(TERABOX_REGEX))
+async def handle_terabox(client, message: Message):
+    user_id = message.from_user.id
+
+    if IS_VERIFY and not await is_verified(user_id):
+        verify_url = await build_verification_link(client.me.username, user_id)
+        buttons = [
+            [
+                InlineKeyboardButton("✅ Verify Now", url=verify_url),
+                InlineKeyboardButton("📖 Tutorial", url=HOW_TO_VERIFY)
+            ]
+        ]
+        await message.reply_text(
+            "🔐 You must verify before using this command.\n\n⏳ Verification lasts for 12 hours.",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    url = message.text.strip()
+    try:
+        info = get_download_info(url)
+    except Exception as e:
+        return await message.reply(f"❌ Failed to get file info:\n{e}")
+
+    download_options = info.get("download_options") or {}
+    if len(download_options) > 1:
+        selection_id = cache_quality_selection(user_id, info)
+        await message.reply(
+            f"🎞 Select download quality for `{info['name']}`:",
+            reply_markup=build_quality_buttons(selection_id, info)
+        )
+        return
+
+    if download_options:
+        info["download_link"] = next(iter(download_options.values()))
+
+    await download_and_upload(client, message, info)
+
+
+@Client.on_callback_query(filters.regex(r"^tera_dl:"))
+async def handle_quality_selection(client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    try:
+        _, selection_id, quality = callback_query.data.split(":", 2)
+    except ValueError:
+        return await callback_query.answer("Invalid selection.", show_alert=True)
+
+    selection = get_cached_quality_selection(selection_id, user_id)
+    if not selection:
+        return await callback_query.answer("This quality selection expired. Send the link again.", show_alert=True)
+
+    info = selection["info"].copy()
+    download_url = info.get("download_options", {}).get(quality)
+    if not download_url:
+        return await callback_query.answer("Selected quality is unavailable.", show_alert=True)
+
+    QUALITY_SELECTIONS.pop(selection_id, None)
+    info["download_link"] = download_url
+    await callback_query.answer(f"Selected {quality}")
+    await callback_query.message.edit_reply_markup(reply_markup=None)
+    await download_and_upload(client, callback_query.message, info)
