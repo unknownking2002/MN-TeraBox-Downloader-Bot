@@ -1,5 +1,4 @@
 
-# Currently this repo wont work perfectly so vote https://t.me/mnbots/604 here to get new terabox downloader.
 
 
 # 📦 TeraBox Downloader Telegram Bot
